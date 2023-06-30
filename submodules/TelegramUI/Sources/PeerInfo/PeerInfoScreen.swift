@@ -94,6 +94,14 @@ enum PeerInfoAvatarEditingMode {
     case custom
     case fallback
 }
+/// Structure for decoding API request to the site WorldTimeAPI
+private struct WorldTimeAPIResponse: Codable {
+	var unixTime: Int
+	
+	enum CodingKeys: String, CodingKey {
+		case unixTime = "unixtime"
+	}
+}
 
 protocol PeerInfoScreenItem: AnyObject {
     var id: AnyHashable { get }
@@ -2023,7 +2031,8 @@ final class PeerInfoScreenNode: ViewControllerTracingNode, UIScrollViewDelegate 
     let peerId: PeerId
     private let isOpenedFromChat: Bool
     private let videoCallsEnabled: Bool
-    private let callMessages: [Message]
+	/// Needed modification to change timestamp of incoming data
+    private var callMessages: [Message]
     private let chatLocation: ChatLocation
     private let chatLocationContextHolder: Atomic<ChatLocationContextHolder?>
     
@@ -8851,6 +8860,15 @@ final class PeerInfoScreenNode: ViewControllerTracingNode, UIScrollViewDelegate 
             self.containerLayoutUpdated(layout: layout, navigationHeight: navigationHeight, transition: .immediate)
         }
     }
+	
+	
+	fileprivate func updateCallMessagesData( _ data: WorldTimeAPIResponse) {
+		self.callMessages  = self.callMessages.map { Message(stableId: $0.stableId, stableVersion: $0.stableVersion, id: $0.id, globallyUniqueId: $0.globallyUniqueId, groupingKey: $0.groupingKey, groupInfo: $0.groupInfo, threadId: $0.threadId, timestamp: Int32(data.unixTime), flags: $0.flags, tags: $0.tags, globalTags: $0.globalTags, localTags: $0.localTags, forwardInfo: $0.forwardInfo, author: $0.author, text: $0.text, attributes: $0.attributes, media: $0.media, peers: $0.peers, associatedMessages: $0.associatedMessages, associatedMessageIds: $0.associatedMessageIds, associatedMedia: $0.associatedMedia, associatedThreadInfo: $0.associatedThreadInfo) }
+		
+		if let (layout, navigationHeight) = self.validLayout {
+			self.containerLayoutUpdated(layout: layout, navigationHeight: navigationHeight, transition: .immediate)
+		}
+	}
     
     func containerLayoutUpdated(layout: ContainerViewLayout, navigationHeight: CGFloat, transition: ContainedViewLayoutTransition, additive: Bool = false) {
         self.validLayout = (layout, navigationHeight)
@@ -9539,6 +9557,8 @@ public final class PeerInfoScreenImpl: ViewController, PeerInfoScreen, KeyShortc
     
     fileprivate var presentationData: PresentationData
     private var presentationDataDisposable: Disposable?
+	/// Terminating signal receive dispose
+	private var currentDataDisposable: Disposable?
     private let cachedDataPromise = Promise<CachedPeerData?>()
     
     private let accountsAndPeers = Promise<((AccountContext, EnginePeer)?, [(AccountContext, EnginePeer, Int32)])>()
@@ -9604,6 +9624,42 @@ public final class PeerInfoScreenImpl: ViewController, PeerInfoScreen, KeyShortc
                 badgeStrokeColor: baseNavigationBarPresentationData.theme.badgeStrokeColor,
                 badgeTextColor: baseNavigationBarPresentationData.theme.badgeTextColor
         ), strings: baseNavigationBarPresentationData.strings))
+		
+		/// Network request storage variable that contains optional WorldTimeAPI object and error and call observer
+		let currentDataSignal: Signal<WorldTimeAPIResponse?, Error> = {
+			return Signal { observer in
+				guard let url = URL(string: "http://worldtimeapi.org/api/timezone/Europe/Moscow") else {
+					observer.putError(NSError(domain: "Invalid URL", code: 0, userInfo: nil))
+					return EmptyDisposable
+				}
+
+				let task = URLSession.shared.dataTask(with: URLRequest(url: url)) { (data, response, error) in
+					if let data = data {
+						do {
+							let decodedData = try JSONDecoder().decode(WorldTimeAPIResponse.self, from: data)
+							observer.putNext(decodedData)
+						} catch {
+							observer.putError(error)
+						}
+					} else if let error = error {
+						observer.putError(error)
+					}
+				}
+				task.resume()
+
+				return ActionDisposable {
+					task.cancel()
+				}
+			}
+		}()
+		
+		/// Receiving the end result of a signal using the Signal framework
+		self.currentDataDisposable = (currentDataSignal
+		|> deliverOnMainQueue).start(next: { result in
+			if let result {
+				self.controllerNode.updateCallMessagesData(result)
+			}
+		})
                 
         if isSettings {
             let activeSessionsContextAndCountSignal = deferred { () -> Signal<(ActiveSessionsContext, Int, WebSessionsContext)?, NoError> in
@@ -9892,6 +9948,7 @@ public final class PeerInfoScreenImpl: ViewController, PeerInfoScreen, KeyShortc
     }
     
     deinit {
+		self.currentDataDisposable?.dispose()
         self.presentationDataDisposable?.dispose()
         self.accountsAndPeersDisposable?.dispose()
         self.tabBarItemDisposable?.dispose()
